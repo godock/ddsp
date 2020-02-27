@@ -17,6 +17,7 @@
 
 from absl import logging
 import apache_beam as beam
+from ddsp.spectral_ops import _CREPE_SAMPLE_RATE
 from ddsp.spectral_ops import compute_f0
 from ddsp.spectral_ops import compute_loudness
 import numpy as np
@@ -25,10 +26,8 @@ import tensorflow.compat.v2 as tf
 
 
 
-def _load_audio(audio_path, sample_rate):
-  """Load audio file."""
-  logging.info("Loading '%s'.", audio_path)
-  beam.metrics.Metrics.counter('prepare-tfrecord', 'load-audio').inc()
+def _load_audio_as_array(audio_path, sample_rate):
+  """Load audio file at specified sample rate and return an array."""
   with tf.io.gfile.GFile(audio_path, 'rb') as f:
     audio_segment = (
         pydub.AudioSegment.from_file(f)
@@ -36,7 +35,18 @@ def _load_audio(audio_path, sample_rate):
   audio = np.array(audio_segment.get_array_of_samples()).astype(np.float32)
   # Convert from int to float representation.
   audio /= 2**(8 * audio_segment.sample_width)
-  return {'audio': audio}
+  return audio
+
+
+def _load_audio(audio_path, sample_rate):
+  """Load audio file."""
+  logging.info("Loading '%s'.", audio_path)
+  beam.metrics.Metrics.counter('prepare-tfrecord', 'load-audio').inc()
+  audio = _load_audio_as_array(audio_path, sample_rate)
+  # Crepe pitch extraction only works at 16Khz sample rate
+  audio_crepe = _load_audio_as_array(audio_path,
+                                     _CREPE_SAMPLE_RATE)
+  return {'audio': audio, 'audio_crepe': audio_crepe}
 
 
 def _add_loudness(ex, sample_rate, frame_rate, n_fft=2048):
@@ -49,11 +59,11 @@ def _add_loudness(ex, sample_rate, frame_rate, n_fft=2048):
   return ex
 
 
-def _add_f0_estimate(ex, sample_rate, frame_rate):
+def _add_f0_estimate(ex, frame_rate):
   """Add fundamental frequency (f0) estimate using CREPE."""
   beam.metrics.Metrics.counter('prepare-tfrecord', 'estimate-f0').inc()
-  audio = ex['audio']
-  f0_hz, f0_confidence = compute_f0(audio, sample_rate, frame_rate)
+  audio = ex['audio_crepe']
+  f0_hz, f0_confidence = compute_f0(audio, _CREPE_SAMPLE_RATE, frame_rate)
   ex = dict(ex)
   ex.update({
       'f0_hz': f0_hz.astype(np.float32),
@@ -140,7 +150,7 @@ def prepare_tfrecord(
     if frame_rate:
       examples = (
           examples
-          | beam.Map(_add_f0_estimate, sample_rate, frame_rate)
+          | beam.Map(_add_f0_estimate, frame_rate)
           | beam.Map(_add_loudness, sample_rate, frame_rate))
 
     if window_secs:
@@ -156,4 +166,3 @@ def prepare_tfrecord(
             num_shards=num_shards,
             coder=beam.coders.ProtoCoder(tf.train.Example))
     )
-
